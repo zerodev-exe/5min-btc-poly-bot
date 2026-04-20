@@ -138,6 +138,31 @@ def get_window_open_price(symbol: str, window_ts: int) -> float:
     except Exception:
         return 0.0
 
+
+def get_closed_candle_close(symbol: str, window_ts: int) -> float:
+    """
+    Fetches the close price of a closed 5min candle from Binance.
+    window_ts is the Unix timestamp of the period start (which just closed).
+    """
+    try:
+        r = requests.get(
+            f"{BINANCE_API}/api/v3/klines",
+            params={
+                "symbol":    symbol,
+                "interval":  "5m",
+                "startTime": window_ts * 1000,
+                "limit":     1,
+            },
+            timeout=3
+        )
+        r.raise_for_status()
+        candles = r.json()
+        if candles:
+            return float(candles[0][4])  # close price
+        return 0.0
+    except Exception:
+        return 0.0
+
 # ─── TECHNICAL ANALYSIS ────────────────────────────────────────────────────────
 
 def get_atr(symbol: str, window_ts: int, periods: int = 5) -> float:
@@ -269,6 +294,94 @@ def analyze(symbol: str, window_ts: int) -> dict:
     }
 
 # ─── POLYMARKET API ────────────────────────────────────────────────────────────
+def get_resolved_market_by_condition(condition_id: str, crypto: str) -> dict | None:
+    """
+    Fetches a resolved market by conditionId to get the actual outcome.
+    """
+    if not condition_id:
+        return None
+
+    try:
+        r = requests.get(f"{GAMMA_API}/markets", params={"conditionId": condition_id}, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        if isinstance(data, list):
+            markets = data
+        else:
+            markets = [data] if data else []
+    except Exception:
+        return None
+
+    for market in markets:
+        if not market.get("closed"):
+            continue
+
+        outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+        outcomes       = json.loads(market.get("outcomes", "[]"))
+        clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+
+        if len(outcome_prices) < 2 or len(clob_token_ids) < 2:
+            continue
+
+        prices = [float(p) for p in outcome_prices]
+        winner_idx = 0 if prices[0] >= prices[1] else 1
+
+        return {
+            "condition_id": condition_id,
+            "crypto":       crypto,
+            "winner_side":  outcomes[winner_idx],
+            "winner_price": prices[winner_idx],
+            "loser_price":  prices[1 - winner_idx],
+        }
+
+    return None
+
+
+def get_resolved_market(slug_prefix: str, close_ts: int) -> dict | None:
+    """
+    Fetches a resolved market to get the actual outcome (legacy slug-based).
+    """
+    start_ts = close_ts - 300
+    slug = f"{slug_prefix}-{start_ts}"
+    try:
+        r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        event = data[0]
+    except Exception:
+        return None
+
+    if not event.get("closed"):
+        return None
+
+    markets = event.get("markets", [])
+    if not markets:
+        return None
+
+    market = markets[0]
+    outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+    outcomes       = json.loads(market.get("outcomes", "[]"))
+    clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+
+    if len(outcome_prices) < 2 or len(clob_token_ids) < 2:
+        return None
+
+    prices = [float(p) for p in outcome_prices]
+    winner_idx = 0 if prices[0] >= prices[1] else 1
+
+    return {
+        "slug":         slug,
+        "crypto":       MARKETS[slug_prefix],
+        "winner_side":  outcomes[winner_idx],
+        "winner_price": prices[winner_idx],
+        "loser_price":  prices[1 - winner_idx],
+    }
+
+
 def get_market_for_close(slug_prefix: str, close_ts: int) -> dict | None:
     start_ts = close_ts - 300
     slug = f"{slug_prefix}-{start_ts}"
@@ -362,6 +475,7 @@ class CryptoBot:
         self.amount       = amount
         self.traded_slugs = set()
         self.trades       = []
+        self.closed_markets = set()  # track verified closed markets
         self.private_key  = os.getenv("POLY_PRIVATE_KEY", "")
         self.proxy_wallet = os.getenv("POLY_PROXY_WALLET", "")
 
@@ -417,6 +531,8 @@ class CryptoBot:
                 log("⏰ Market closed.")
                 for prefix in MARKETS:
                     self.traded_slugs.add(f"{prefix}-{close_ts - 300}")
+                if self.paper or self.dry_run:
+                    self._verify_closed_markets(close_ts)
                 break
 
             pending = [
@@ -554,6 +670,8 @@ class CryptoBot:
                 "pnl_expected": expected_pnl,
                 "delta_pct":    ta.get("delta_pct", 0),
                 "confidence":   ta.get("confidence", 0),
+                "condition_id": market.get("condition_id", ""),
+                "close_ts":     market.get("close_ts", 0),
                 "timestamp":    ts_str(),
             })
             log(f"   ✅ Trade #{len(self.trades)} recorded [{crypto}]")
@@ -563,16 +681,70 @@ class CryptoBot:
         log(f"SUMMARY — {len(self.trades)} trades")
         total_invested = sum(t["amount"] for t in self.trades)
         total_expected = sum(t["pnl_expected"] for t in self.trades)
+        total_actual    = sum(t["pnl_actual"] for t in self.trades if "pnl_actual" in t)
         for t in self.trades:
+            pnl_actual_str = f"+${t['pnl_actual']:.2f}" if "pnl_actual" in t else "PENDING"
             log(f"  [{t['crypto']}] {t['title'][:35]} | {t['side']} @ "
                 f"{t['price_entry']:.3f} | {t['seconds_left']:.0f}s | "
                 f"delta:{t['delta_pct']:.4f}% | conf:{t['confidence']:.0%} | "
-                f"+${t['pnl_expected']:.2f}")
+                f"exp:+${t['pnl_expected']:.2f} | actual:{pnl_actual_str}")
         if self.trades:
             log(f"  Total invested: ${total_invested:.2f}")
-            log(f"  Expected PnL:   +${total_expected:.2f} "
+            log(f"  Expected PnL:  +${total_expected:.2f} "
                 f"(+{total_expected/total_invested*100:.1f}%)")
+            if total_actual != 0:
+                log(f"  Actual PnL:    +${total_actual:.2f} "
+                    f"(+{total_actual/total_invested*100:.1f}%)")
         log("─" * 60)
+
+    def _verify_closed_markets(self, close_ts: int):
+        """
+        Verifies the outcome using Binance 5min candle (up vs down).
+        Only runs in paper or dry-run mode.
+        """
+        if not self.trades:
+            return
+
+        market_close_key = close_ts - 300
+        window_open_ts = close_ts - 300
+
+        for t in self.trades:
+            trade_slug = f"{t['crypto'].lower()}-updown-5m-{market_close_key}"
+            if trade_slug in self.closed_markets:
+                continue
+            if t.get("verified"):
+                continue
+
+            symbol = BINANCE_SYMBOLS.get(t["crypto"])
+            if not symbol:
+                continue
+
+            open_price = get_window_open_price(symbol, window_open_ts)
+            close_price = get_closed_candle_close(symbol, window_open_ts)
+
+            if open_price <= 0 or close_price <= 0:
+                log(f"   ⚠️ Could not get Binance prices for {t['crypto']}")
+                continue
+
+            actual_side = "Up" if close_price > open_price else "Down"
+            won = actual_side == t["side"]
+
+            if won:
+                pnl_actual = (self.amount / t["price_entry"]) - self.amount
+            else:
+                pnl_actual = -self.amount
+
+            t["verified"] = True
+            t["pnl_actual"] = pnl_actual
+            t["actual_side"] = actual_side
+            t["close_price"] = close_price
+            t["open_price"] = open_price
+
+            self.closed_markets.add(trade_slug)
+
+            result = "✅ WON" if won else "❌ LOST"
+            log(f"   {result} [{t['crypto']}] predicted {t['side']}, actual {actual_side} | "
+                f"Binance: {open_price:.2f} → {close_price:.2f} | pnl: +${pnl_actual:.2f}")
 
 
 # ─── ENTRY POINT ───────────────────────────────────────────────────────────────
