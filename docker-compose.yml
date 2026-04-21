@@ -3,5 +3,7 @@ services:
     build: .
     env_file:
       - .env
-    command: ["--live"]
+    environment:
+      - AMOUNT=${AMOUNT:-10}
+    command: ["--live", "--amount", "${AMOUNT:-10}"]
     restart: unless-stopped
